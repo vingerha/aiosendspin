@@ -27,10 +27,12 @@ class TestAudioTransformerProtocol:
             def frame_duration_us(self) -> int:
                 return 25_000
 
-            def process(self, pcm: bytes, _timestamp_us: int, _duration_us: int) -> list[bytes]:
-                return [pcm]
+            def process(
+                self, pcm: bytes, _timestamp_us: int, _duration_us: int
+            ) -> list[tuple[bytes, int]]:
+                return [(pcm, 25_000)]
 
-            def flush(self) -> list[bytes]:
+            def flush(self) -> list[tuple[bytes, int]]:
                 return []
 
             def reset(self) -> None:
@@ -38,7 +40,7 @@ class TestAudioTransformerProtocol:
 
         # Should be recognized as implementing the protocol
         transformer: AudioTransformer = ValidTransformer()
-        assert transformer.process(b"test", 0, 1000) == [b"test"]
+        assert transformer.process(b"test", 0, 1000) == [(b"test", 25_000)]
 
     def test_protocol_defines_reset_method(self) -> None:
         """AudioTransformer requires reset() method."""
@@ -51,10 +53,12 @@ class TestAudioTransformerProtocol:
             def frame_duration_us(self) -> int:
                 return 25_000
 
-            def process(self, pcm: bytes, _timestamp_us: int, _duration_us: int) -> list[bytes]:
-                return [pcm]
+            def process(
+                self, pcm: bytes, _timestamp_us: int, _duration_us: int
+            ) -> list[tuple[bytes, int]]:
+                return [(pcm, 25_000)]
 
-            def flush(self) -> list[bytes]:
+            def flush(self) -> list[tuple[bytes, int]]:
                 return []
 
             def reset(self) -> None:
@@ -72,10 +76,12 @@ class TestAudioTransformerProtocol:
             def frame_duration_us(self) -> int:
                 return 25_000
 
-            def process(self, pcm: bytes, _timestamp_us: int, _duration_us: int) -> list[bytes]:
-                return [pcm]
+            def process(
+                self, pcm: bytes, _timestamp_us: int, _duration_us: int
+            ) -> list[tuple[bytes, int]]:
+                return [(pcm, 25_000)]
 
-            def flush(self) -> list[bytes]:
+            def flush(self) -> list[tuple[bytes, int]]:
                 return []
 
             def reset(self) -> None:
@@ -92,17 +98,19 @@ class TestAudioTransformerProtocol:
             def frame_duration_us(self) -> int:
                 return 25_000
 
-            def process(self, pcm: bytes, _timestamp_us: int, _duration_us: int) -> list[bytes]:
-                return [pcm]
+            def process(
+                self, pcm: bytes, _timestamp_us: int, _duration_us: int
+            ) -> list[tuple[bytes, int]]:
+                return [(pcm, 25_000)]
 
-            def flush(self) -> list[bytes]:
-                return [b"final"]
+            def flush(self) -> list[tuple[bytes, int]]:
+                return [(b"final", 25_000)]
 
             def reset(self) -> None:
                 pass
 
         transformer: AudioTransformer = TransformerWithFlush()
-        assert transformer.flush() == [b"final"]
+        assert transformer.flush() == [(b"final", 25_000)]
 
 
 class TestPcmPassthrough:
@@ -137,7 +145,7 @@ class TestPcmPassthrough:
         result = transformer.process(pcm, timestamp_us=0, duration_us=25_000)
         assert isinstance(result, list)
         assert len(result) == 1
-        assert result[0] == pcm
+        assert result[0] == (pcm, 25_000)
 
     def test_passthrough_splits_large_input(self) -> None:
         """PcmPassthrough splits large input into multiple frames."""
@@ -145,8 +153,8 @@ class TestPcmPassthrough:
         pcm = bytes(9600)  # 50ms = 2 frames
         result = transformer.process(pcm, timestamp_us=0, duration_us=50_000)
         assert len(result) == 2
-        assert len(result[0]) == 4800
-        assert len(result[1]) == 4800
+        assert len(result[0][0]) == 4800
+        assert len(result[1][0]) == 4800
 
     def test_passthrough_buffers_incomplete_frame(self) -> None:
         """PcmPassthrough buffers incomplete frames."""
@@ -164,7 +172,7 @@ class TestPcmPassthrough:
             bytes(2880), timestamp_us=15_000, duration_us=15_000
         )  # +15ms = 30ms total
         assert len(result2) == 1
-        assert len(result2[0]) == 4800
+        assert len(result2[0][0]) == 4800
 
     def test_passthrough_flush_emits_remainder_padded(self) -> None:
         """PcmPassthrough flush emits remaining buffer padded with silence."""
@@ -172,7 +180,7 @@ class TestPcmPassthrough:
         transformer.process(bytes(1920), timestamp_us=0, duration_us=10_000)
         result = transformer.flush()
         assert len(result) == 1
-        assert len(result[0]) == 4800  # Padded to 25ms
+        assert len(result[0][0]) == 4800  # Padded to 25ms
 
     def test_passthrough_flush_empty_buffer(self) -> None:
         """PcmPassthrough flush returns empty list when buffer is empty."""
@@ -246,6 +254,37 @@ class TestPcmPassthroughTimestampDrift:
         assert len(result) == 1
         # Pending advances by `1102 * 1_000_000 // 44100` = 24988 µs (NOT 25000)
         assert transformer.pending_timestamp_us == 24988
+        # Wire duration on returned tuple matches advance — no scalar 25_000.
+        assert result[0][1] == 24988
+
+    def test_passthrough_44100_returned_dur_alternates(self) -> None:
+        """Per-frame returned `frame_duration_us` alternates 24988/24989 at 44.1k.
+
+        Guards against regression where pending advances correctly via residue
+        but the emitted tuple reports a stale scalar `chunk_duration_us`.
+        """
+        transformer = PcmPassthrough(sample_rate=44100, bit_depth=16, channels=2)
+        chunk_samples = 1102
+        frame_size = chunk_samples * 4  # stereo s16
+        n = 1000
+        durs: list[int] = []
+        ts_residue = 0
+        ts = 0
+        while len(durs) < n:
+            for _, dur in transformer.process(
+                bytes(frame_size), timestamp_us=ts, duration_us=25_000
+            ):
+                durs.append(dur)
+            ts_residue += chunk_samples * 1_000_000
+            delta, ts_residue = divmod(ts_residue, 44100)
+            ts += delta
+        # Every per-frame duration is exactly one of the two valid divmod outputs.
+        assert set(durs) <= {24988, 24989}, (
+            f"unexpected per-frame durs: {set(durs) - {24988, 24989}}"
+        )
+        # Cumulative duration matches sample-derived elapsed time exactly.
+        expected = n * chunk_samples * 1_000_000 // 44100
+        assert sum(durs) == expected, f"sum(durs)={sum(durs)} expected={expected}"
 
     def test_passthrough_44100_no_drift_after_one_thousand_frames(self) -> None:
         """After 1000 frames at 44.1k, pending matches sample-derived elapsed time exactly."""
@@ -488,10 +527,10 @@ class TestTransformerPool:
             def frame_duration_us(self) -> int:
                 return 25_000
 
-            def process(self, pcm: bytes, _ts: int, _dur: int) -> list[bytes]:
-                return [pcm]
+            def process(self, pcm: bytes, _ts: int, _dur: int) -> list[tuple[bytes, int]]:
+                return [(pcm, 25_000)]
 
-            def flush(self) -> list[bytes]:
+            def flush(self) -> list[tuple[bytes, int]]:
                 return []
 
             def get_header(self) -> bytes | None:
@@ -530,7 +569,7 @@ class TestFlacEncoder:
         # 25ms of silence at 48kHz stereo 16-bit = 1200 samples * 4 bytes = 4800 bytes
         # Send multiple chunks to ensure encoder produces output (FLAC buffers initial frames)
         pcm = bytes(4800)
-        total_output: list[bytes] = []
+        total_output: list[tuple[bytes, int]] = []
         for i in range(4):
             result = encoder.process(pcm, timestamp_us=i * 25_000, duration_us=25_000)
             total_output.extend(result)
@@ -541,7 +580,7 @@ class TestFlacEncoder:
         encoder = FlacEncoder(sample_rate=48000, bit_depth=32, channels=2)
         # 25ms at 48kHz stereo 32-bit: 1200 samples * 8 bytes = 9600 bytes.
         pcm = bytes(9600)
-        total_output: list[bytes] = []
+        total_output: list[tuple[bytes, int]] = []
         for i in range(4):
             result = encoder.process(pcm, timestamp_us=i * 25_000, duration_us=25_000)
             total_output.extend(result)
@@ -581,7 +620,7 @@ class TestFlacEncoder:
         # FLAC codec buffers ~4 frames before emitting output
         # Feed enough frames to guarantee output
         pcm = bytes(4800)  # 25ms per chunk
-        all_results: list[bytes] = []
+        all_results: list[tuple[bytes, int]] = []
         for i in range(8):  # 200ms total
             result = encoder.process(pcm, timestamp_us=i * 25_000, duration_us=25_000)
             assert isinstance(result, list)
