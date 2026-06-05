@@ -260,7 +260,26 @@ async def test_late_join_target_includes_player_static_delay() -> None:
 
     stream = PushStream(loop=loop, clock=clock, group=group)
 
-    assert stream.get_late_join_target_timestamp_us(role=role) == 6_100_000
+    # now + max(LATE_JOINER_MIN_LEAD_US=100ms, required_lead=250ms) + static_delay=5s
+    assert stream.get_late_join_target_timestamp_us(role=role) == 6_250_000
+
+
+@pytest.mark.asyncio
+async def test_late_join_target_uses_required_lead_time() -> None:
+    """Required lead time bumps the floor when it exceeds the static minimum."""
+    loop = asyncio.get_running_loop()
+    clock = ManualClock(now_us_value=1_000_000)
+    group = _DummyGroup(clients=[])
+    client, _ = _make_connected_player(loop, group, "p1", clock=clock)
+    role = client.role("player@v1")
+    assert role is not None
+    role.static_delay_ms = 5_000
+    role.required_lead_time_ms = 400  # > 100ms default floor
+
+    stream = PushStream(loop=loop, clock=clock, group=group)
+
+    # now + max(100ms, 400ms required_lead) + 5s static_delay
+    assert stream.get_late_join_target_timestamp_us(role=role) == 6_400_000
 
 
 @pytest.mark.asyncio
@@ -2525,6 +2544,7 @@ async def test_replay_from_pcm_cache_overrides_established_resampler_skip() -> N
             frame_duration_us=25_000,
         ),
         replay_from_pcm_cache=True,
+        required_lead_time_us=100_000,
     )
     group.clients.append(_DummyClient([viz_role]))
     stream.on_role_join(viz_role)
@@ -2916,6 +2936,37 @@ async def test_buffered_source_skips_min_buffer_at_startup() -> None:
 
     # Buffered: startup = lead(0) + static(0) = 0; min_buffer ignored upfront.
     assert play_start == clock.now_us()
+
+
+@pytest.mark.asyncio
+async def test_explicit_play_start_us_overrides_stale_channel_timing() -> None:
+    """Explicit play_start_us is authoritative across mode switches."""
+    loop = asyncio.get_running_loop()
+    clock = ManualClock(now_us_value=1_000_000)
+    group = _DummyGroup(clients=[])
+    role = _make_role(required_lead_time_us=0, min_buffer_us=0, static_delay_us=0)
+    group.clients.append(_DummyClient([role]))
+
+    stream = PushStream(loop=loop, clock=clock, group=group)
+    fmt = AudioFormat(sample_rate=48000, bit_depth=16, channels=2)
+
+    # First commit anchors the channel at an explicit start far ahead of "now".
+    first_play_start_us = 10_000_000
+    stream.prepare_audio(bytes(4800), fmt)
+    returned_first = await stream.commit_audio(play_start_us=first_play_start_us)
+    assert returned_first == first_play_start_us
+
+    # Subsequent commit with a different play_start_us must overwrite the
+    # advanced channel timing, not be ignored because the channel already exists.
+    second_play_start_us = 20_000_000
+    stream.prepare_audio(bytes(4800), fmt)
+    returned_second = await stream.commit_audio(play_start_us=second_play_start_us)
+    assert returned_second == second_play_start_us
+
+    # The channel timing now reflects the second play_start_us plus its chunk
+    # duration (25ms @ 48kHz stereo s16 = 25_000us), not first + 2 * duration.
+    expected_after_advance = second_play_start_us + 25_000
+    assert stream._channel_timing[MAIN_CHANNEL] == expected_after_advance  # noqa: SLF001
 
 
 @pytest.mark.asyncio
@@ -3359,7 +3410,8 @@ async def test_catchup_drain_advances_encoder_pending_to_live_tip() -> None:
             transformer=joining_transformer,
             channel_id=MAIN_CHANNEL,
             frame_duration_us=25_000,
-        )
+        ),
+        required_lead_time_us=100_000,
     )
     group.clients.append(_DummyClient([role2]))
     stream.on_role_join(role2)
@@ -3457,7 +3509,8 @@ async def test_catchup_mid_pass_format_change_keeps_chunks_ordered() -> None:
             transformer=Transformer(),
             channel_id=MAIN_CHANNEL,
             frame_duration_us=25_000,
-        )
+        ),
+        required_lead_time_us=100_000,
     )
     group.clients.append(_DummyClient([role2]))
     stream.on_role_join(role2)

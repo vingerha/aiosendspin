@@ -1001,7 +1001,10 @@ class PushStream:
         """Return a safe minimum playback timestamp for late-join replay."""
         now_us = self._clock.now_us()
         delay_us = role.get_static_delay_us() if role is not None else 0
-        target_us = now_us + max(0, min_lead_us) + delay_us
+        effective_lead_us = max(0, min_lead_us)
+        if role is not None:
+            effective_lead_us = max(effective_lead_us, role.get_required_lead_time_us())
+        target_us = now_us + effective_lead_us + delay_us
         if align_to_channel_tail and channel_id is not None and channel_id in self._channel_timing:
             # For channels that currently have no other subscribers, anchor catch-up
             # to that channel's own live tail when it is near real time. If that tail
@@ -1180,12 +1183,12 @@ class PushStream:
         channel_play_start: dict[UUID, int] = {}
 
         if play_start_us is not None:
-            # Explicit timestamp mode: use provided timestamp directly.
+            # Explicit timestamp mode: caller-provided value is authoritative
+            # across mode switches, so overwrite any stale advanced timing.
             for channel_id in prepared:
                 channel_play_start[channel_id] = play_start_us
-                if channel_id not in self._channel_timing:
-                    self._channel_timing[channel_id] = play_start_us
-                    self._channel_timing_residue[channel_id] = 0
+                self._channel_timing[channel_id] = play_start_us
+                self._channel_timing_residue[channel_id] = 0
             return channel_play_start
 
         # Auto-calculate mode (existing behavior).
@@ -2135,8 +2138,8 @@ class PushStream:
     ) -> list[CachedChunk]:
         """Resample PCM chunks to the target format and encode them sequentially.
 
-        Pass `resamplers`/`quantizers` to share state across calls (single resampler,
-        drainable via `_drain_catchup_resamplers`).
+        Pass `resamplers`/`quantizers` to share state across calls (single resampler
+        instance per key reused between batches).
         """
         tkey = self._build_transform_key(req, channel_id)
         cached: list[CachedChunk] = []
@@ -2322,29 +2325,6 @@ class PushStream:
             )
             for data, ts, dur in encoded_frames
         ]
-
-    def _drain_catchup_resamplers(
-        self,
-        resamplers: dict[_ResamplerKey, _ResamplerState],
-        quantizers: dict[_ResamplerKey, _ResamplerState],
-        encoder: AudioTransformer | None,
-        req: AudioRequirements,
-        channel_id: UUID,
-    ) -> list[CachedChunk]:
-        """Flush each catchup resampler's FIR tail and encode the drained PCM.
-
-        Without draining, the resampler's FIR holds samples past the catchup
-        tail, leaving a content gap before the first live chunk. Drain emits
-        those held samples on the live timeline so live picks up seamlessly.
-        """
-        cached: list[CachedChunk] = []
-        for resampler_state in resamplers.values():
-            cached.extend(
-                self._flush_resampler_to_chunks(
-                    resampler_state, quantizers, encoder, req, channel_id
-                )
-            )
-        return cached
 
     async def _start_catchup_encoding(  # noqa: PLR0915
         self,
