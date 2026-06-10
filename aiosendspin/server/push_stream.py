@@ -1965,15 +1965,15 @@ class PushStream:
                             self._ensure_role_started(role)
                         return
 
-                if not role.replay_from_pcm_cache() and self._has_established_resampler_for(
-                    req, channel_id
+                if (
+                    not role.replay_from_pcm_cache()
+                    and self._has_established_resampler_for(req, channel_id)
+                    and self._skip_replay_keeps_join_near_playhead(channel_id, role)
                 ):
-                    # Sharing a resampler key with a live role would shift this
-                    # role's audio across the hand-off; skip historical replay.
-                    # Analysis-only roles opt out: their catch-up uses isolated
-                    # resampler state and an inaudible seam, so replaying the
-                    # buffered PCM now beats waiting for a live commit that may
-                    # sit far ahead behind the producer buffer.
+                    # A live role drives this resampler shape, so replaying through it
+                    # would shift the live role's audio across the hand-off. Skip replay
+                    # only when live audio lands near the playhead, else fall through to
+                    # catch-up so the joiner is not stranded waiting at a far-ahead tail.
                     self._rebase_far_ahead_join_tail(channel_id, role)
                     if self._channel_timing:
                         self._ensure_role_started(role)
@@ -2109,15 +2109,33 @@ class PushStream:
         )
         self._channel_timing_residue[channel_id] = 0
 
+    def _skip_replay_keeps_join_near_playhead(self, channel_id: UUID, role: Role) -> bool:
+        """Whether skipping PCM replay still lands the joiner near the playhead.
+
+        True when the tail is within a normal buffer of now, or far ahead but
+        clampable. A far-ahead tail that cannot be clamped means the joiner must
+        replay instead of waiting for live audio at the tail.
+        """
+        tail_us = self._channel_timing.get(channel_id)
+        if tail_us is None:
+            return True
+        now_us = self._clock.now_us()
+        if tail_us <= now_us + self._role_send_ahead_us(role):
+            return True
+        return self._can_clamp_far_ahead_tail(channel_id, role)
+
+    def _can_clamp_far_ahead_tail(self, channel_id: UUID, role: Role) -> bool:
+        """Whether the tail can move, blocked by other roles or committed audio."""
+        return not (
+            self._channel_has_other_audio_roles(channel_id, role)
+            or channel_id in self._channels_with_committed_audio
+        )
+
     def _rebase_far_ahead_join_tail(self, channel_id: UUID, joining_role: Role) -> None:
         """Clamp far-ahead solo-channel timing so a rejoin can resume promptly."""
         if channel_id not in self._channel_timing:
             return
-        if self._channel_has_other_audio_roles(channel_id, joining_role):
-            return
-        if channel_id in self._channels_with_committed_audio:
-            # Do not rebase if the channel already has committed audio, as changing the timing
-            # will de-sync it from other clients.
+        if not self._can_clamp_far_ahead_tail(channel_id, joining_role):
             return
         now_us = self._clock.now_us()
         max_resume_start_us = now_us + self._role_send_ahead_us(joining_role)
