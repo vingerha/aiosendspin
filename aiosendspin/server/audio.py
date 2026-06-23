@@ -108,7 +108,7 @@ class AudioFormat:
         elif self.channels == 7:
             layout = "6.1"
         elif self.channels == 8:
-            layout = "7.1"             
+            layout = "7.1"
         elif self.channels == 10:
             layout = "9.1"
         else:
