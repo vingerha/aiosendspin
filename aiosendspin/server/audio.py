@@ -109,10 +109,9 @@ class AudioFormat:
             layout = "6.1"
         elif self.channels == 8:
             layout = "7.1"             
+        elif self.channels == 10:
+            layout = "9.1"
         else:
-            # 9 and 10 channels (e.g. "9.1") have no single
-            # layout alike 5.1/7.1 / FFmpeg raises
-            # "Error parsing channel layout: 9.1")
             raise ValueError(f"Unsupported channel count: {self.channels}")
 
         return wire_bytes_per_sample, av_format, layout, av_bytes_per_sample
