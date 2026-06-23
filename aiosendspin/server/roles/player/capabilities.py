@@ -24,7 +24,7 @@ def can_encode_format(fmt: SupportedAudioFormat) -> bool:
     Validates against server encoding constraints:
     - PCM bit depth: 16, 24, or 32; channels: 1-8 or 10 (up to 9.1)
     - FLAC bit depth: 16, 24, or 32; channels: 1-8 or 10 (up to 9.1)
-    - Opus bit depth: 16 only; channels: 1 or 2 only, as multichannel Opus requires libopus multistream, RFC 7845 — not yet implemented;
+    - Opus bit depth: 16 only; channels: 1 or 2 only, as multichannel not yet implemented
     - Opus: sample rate must be one of 8k, 12k, 16k, 24k, 48k
     - FLAC/PCM: any sample rate
 
