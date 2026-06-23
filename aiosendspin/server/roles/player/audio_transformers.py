@@ -415,10 +415,6 @@ class OpusEncoder:
             valid = sorted(self.VALID_SAMPLE_RATES)
             msg = f"Opus only supports sample rates {valid}, got {sample_rate}"
             raise ValueError(msg)
-        # Opus multichannel requires libopus multistream (RFC 7845) — not yet implemented.
-        if channels not in {1, 2}:
-            msg = f"Opus only supports 1 or 2 channels, got {channels}"
-            raise ValueError(msg)
 
         self._sample_rate = sample_rate
         self._channels = channels
